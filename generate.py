@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import warnings
+import math
 
 warnings.filterwarnings('ignore')
 
@@ -390,14 +391,18 @@ def i2v_generate(self,
 
         latent = noise
 
+        # Compute freqs using RIFLEx parameters (already computed in caller)
         freqs = self.model.get_rope_freqs(nb_latent_frames=latent_frames, RIFLEx_k=riflex_k)
-        logging.debug(f"Using riflex_L_test (latent frames) = {latent_frames} and riflex_k = {riflex_k}")
+        logging.debug(f"TeaCache Forward (GEN): Computed freqs shape: {freqs.shape}")
+        logging.debug(f"TeaCache Forward (GEN): Using riflex_L_test (latent frames) = {latent_frames} and riflex_k = {riflex_k}")
+
+        # IMPORTANT: Use the passed-in freqs here
         arg_c = {
             'context': [context[0]],
             'clip_fea': clip_context,
             'seq_len': max_seq_len,
             'y': [y],
-            'freqs': freqs,
+            'freqs': freqs,  # Changed from self.freqs to freqs
             'pipeline': self
         }
         arg_null = {
@@ -405,7 +410,7 @@ def i2v_generate(self,
             'clip_fea': clip_context,
             'seq_len': max_seq_len,
             'y': [y],
-            'freqs': freqs,
+            'freqs': freqs,  # Changed from self.freqs to freqs
             'pipeline': self
         }
 
@@ -417,10 +422,12 @@ def i2v_generate(self,
             latent_model_input = [latent.to(self.device)]
             timestep = torch.stack([t]).to(self.device)
 
-            noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c)[0].to(torch.device('cpu') if offload_model else self.device)
+            noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c)[0].to(
+                torch.device('cpu') if offload_model else self.device)
             if offload_model:
                 torch.cuda.empty_cache()
-            noise_pred_uncond = self.model(latent_model_input, t=timestep, **arg_null)[0].to(torch.device('cpu') if offload_model else self.device)
+            noise_pred_uncond = self.model(latent_model_input, t=timestep, **arg_null)[0].to(
+                torch.device('cpu') if offload_model else self.device)
             if offload_model:
                 torch.cuda.empty_cache()
             noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
@@ -454,10 +461,12 @@ def teacache_forward(
         seq_len,
         clip_fea=None,
         y=None,
+        freqs=None,
         cond_flag=False,
     ):
     r"""
     Forward pass through the diffusion model
+
     Args:
         x (List[Tensor]):
             List of input video tensors, each with shape [C_in, F, H, W]
@@ -471,6 +480,10 @@ def teacache_forward(
             CLIP image features for image-to-video mode
         y (List[Tensor], *optional*):
             Conditional video inputs for image-to-video mode, same shape as x
+        freqs (Tensor, optional):
+            Rotary embedding frequencies (modified by RIFLEx)
+        cond_flag (bool, optional):
+            Whether this is a conditional pass
     Returns:
         List[Tensor]:
             List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
@@ -478,8 +491,10 @@ def teacache_forward(
     if self.model_type == 'i2v':
         assert clip_fea is not None and y is not None
     device = self.patch_embedding.weight.device
-    if self.freqs.device != device:
-        self.freqs = self.freqs.to(device)
+    # Ensure the passed-in freqs is on the proper device
+    if freqs is not None and freqs.device != device:
+        freqs = freqs.to(device)
+        logging.debug(f"TeaCache Forward (GEN): Moved freqs to device {device}")
 
     if y is not None:
         x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -494,6 +509,9 @@ def teacache_forward(
         e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
         e0 = self.time_projection(e).unflatten(1, (6, self.dim))
         assert e.dtype == torch.float32 and e0.dtype == torch.float32
+    logging.debug(f"teacache_forward: e0 shape: {e0.shape}")
+    logging.debug(f"teacache_forward: seq_lens: {seq_lens}")
+    logging.debug(f"teacache_forward: grid_sizes: {grid_sizes}")
 
     context_lens = None
     context = self.text_embedding(torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]))
@@ -502,13 +520,16 @@ def teacache_forward(
         context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
         context = torch.concat([context_clip, context], dim=1)
 
+    # Use the passed-in freqs instead of self.freqs
     kwargs = dict(
         e=e0,
         seq_lens=seq_lens,
         grid_sizes=grid_sizes,
-        freqs=self.freqs,
+        freqs=freqs,  # Changed: use passed freqs
         context=context,
         context_lens=context_lens)
+    
+    logging.debug(f"TeaCache Forward (GEN): kwargs constructed with freqs shape: {freqs.shape if freqs is not None else 'None'}")
     
     if self.enable_teacache:
         if cond_flag:
@@ -528,12 +549,15 @@ def teacache_forward(
             self.previous_modulated_input = modulated_inp 
             self.cnt = 0 if self.cnt == self.num_steps-1 else self.cnt + 1
             self.should_calc = should_calc
+            logging.debug(f"TeaCache Forward (GEN): cond_flag True, should_calc = {should_calc}, accumulated_rel_l1_distance = {self.accumulated_rel_l1_distance}")
         else:
             should_calc = self.should_calc
+            logging.debug(f"TeaCache Forward (GEN): cond_flag False, should_calc = {should_calc}")
         
     if self.enable_teacache:
         if not should_calc:
             x = x + self.previous_residual_cond if cond_flag else x + self.previous_residual_uncond
+            logging.debug("TeaCache Forward (GEN): Skipping block computation; using cached residual.")
         else:
             ori_x = x.clone()
             for block in self.blocks:
@@ -542,6 +566,7 @@ def teacache_forward(
                 self.previous_residual_cond = x - ori_x
             else:
                 self.previous_residual_uncond = x - ori_x
+            logging.debug("TeaCache Forward (GEN): Computed new residual and updated cache.")
     else:
         for block in self.blocks:
             x = block(x, **kwargs)
