@@ -11,6 +11,8 @@ easydict
 ftfy
 dashscope
 imageio-ffmpeg
-flash_attn
+# flash_attn - Installing separately due to build issues
 gradio>=5.0.0
 numpy>=1.23.5,<2
+wheel>=0.41.0
+setuptools>=69.0.0
